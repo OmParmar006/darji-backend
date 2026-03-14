@@ -45,8 +45,8 @@ MAX_FILE_SIZE_MB    = int(os.getenv("MAX_FILE_SIZE_MB", "10"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 ALLOWED_ORIGINS     = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
-# IDM-VTON model — latest stable version
-VTON_MODEL = "cuuupid/idm-vton:906425dbca90663ff5427624839572cc56ea7d380343d13e2a4c4b09d3f0c30f"
+# IDM-VTON model — latest version (updated March 2026)
+VTON_MODEL = "cuuupid/idm-vton:0513734a452173b8173e907e3a59d19a36266e55b48528559432bd21c7d7e985"
 
 # In-memory job store
 jobs: dict[str, dict] = {}
@@ -156,6 +156,7 @@ async def run_vton_model(
                         "human_img":        io.BytesIO(person_data),
                         "garm_img":         io.BytesIO(garment_data),
                         "garment_des":      description,
+                        "category":         description,   # new field in latest version
                         "is_checked":       True,
                         "is_checked_crop":  True,
                         "denoise_steps":    30,
@@ -180,7 +181,7 @@ async def run_vton_model(
 
         if shirt_bytes and pant_bytes:
             logger.info(f"[{job_id}] Two-pass mode: shirt → pant")
-            shirt_url = await run_single_pass(person_bytes, shirt_bytes, "shirt garment")
+            shirt_url = await run_single_pass(person_bytes, shirt_bytes, "upper_body")
 
             async with httpx.AsyncClient(timeout=60.0) as http:
                 resp = await http.get(shirt_url)
@@ -188,15 +189,15 @@ async def run_vton_model(
                 intermediate_bytes = resp.content
             logger.info(f"[{job_id}] Intermediate downloaded: {len(intermediate_bytes)}B")
 
-            result_url = await run_single_pass(intermediate_bytes, pant_bytes, "pant garment")
+            result_url = await run_single_pass(intermediate_bytes, pant_bytes, "lower_body")
 
         elif shirt_bytes:
             logger.info(f"[{job_id}] Single-pass: shirt only")
-            result_url = await run_single_pass(person_bytes, shirt_bytes, "shirt garment")
+            result_url = await run_single_pass(person_bytes, shirt_bytes, "upper_body")
 
         elif pant_bytes:
             logger.info(f"[{job_id}] Single-pass: pant only")
-            result_url = await run_single_pass(person_bytes, pant_bytes, "pant garment")
+            result_url = await run_single_pass(person_bytes, pant_bytes, "lower_body")
 
         jobs[job_id]["status"]       = "succeeded"
         jobs[job_id]["result_url"]   = result_url
