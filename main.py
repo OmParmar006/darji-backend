@@ -1,15 +1,15 @@
 """
 backend/main.py  —  Darji Pro Virtual Try-On
-Uses HuggingFace IDM-VTON Space (FREE) via Gradio client.
+Uses LightX API (free credits, no card needed).
 
 Setup:
-  pip install fastapi uvicorn python-multipart httpx python-dotenv gradio-client
+  pip install fastapi uvicorn python-multipart httpx python-dotenv
 
 Run:
   uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 
 Environment variables:
-  HF_TOKEN=hf_xxxxxxxxxxxxxxxxxx
+  LIGHTX_API_KEY=your_key_here
   ALLOWED_ORIGINS=*
 """
 
@@ -37,29 +37,26 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-HF_TOKEN            = os.getenv("HF_TOKEN", "")
+LIGHTX_API_KEY      = os.getenv("LIGHTX_API_KEY", "")
 MAX_FILE_SIZE_MB    = int(os.getenv("MAX_FILE_SIZE_MB", "10"))
 MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 ALLOWED_ORIGINS     = os.getenv("ALLOWED_ORIGINS", "*").split(",")
 
-# Primary and fallback space IDs
-HF_SPACES = [
-    "yisol/IDM-VTON",
-    "Nymbo/Virtual-Try-On",
-]
+LIGHTX_BASE_URL = "https://api.lightxeditor.com/external/api/v1"
 
 jobs: dict[str, dict] = {}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Darji Pro Try-On backend started (HuggingFace mode).")
-    if not HF_TOKEN:
-        logger.warning("HF_TOKEN not set — requests may be rate limited.")
+    if not LIGHTX_API_KEY:
+        logger.warning("LIGHTX_API_KEY not set!")
+    else:
+        logger.info("Darji Pro Try-On backend started (LightX mode).")
     yield
 
 
-app = FastAPI(title="Darji Pro Virtual Try-On API", version="4.0.0", lifespan=lifespan)
+app = FastAPI(title="Darji Pro Virtual Try-On API", version="6.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -78,108 +75,111 @@ async def read_and_validate(file: UploadFile, field_name: str) -> bytes:
     return data
 
 
-def try_gradio_client(space_id: str, person_bytes: bytes, garment_bytes: bytes, garment_desc: str, job_id: str) -> str:
-    """Try a single HuggingFace space. Returns result URL or raises."""
-    import tempfile
-    from gradio_client import Client
+async def upload_image_to_lightx(image_bytes: bytes, client: httpx.AsyncClient) -> str:
+    """Upload image bytes to LightX and get back a URL."""
+    headers = {"x-api-key": LIGHTX_API_KEY}
 
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as pf:
-        pf.write(person_bytes)
-        person_path = pf.name
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as gf:
-        gf.write(garment_bytes)
-        garment_path = gf.name
+    # Step 1: Request upload URL from LightX
+    ext_resp = await client.post(
+        f"{LIGHTX_BASE_URL}/upload-image-url",
+        headers=headers,
+        json={"uploadType": "imageUrl", "size": len(image_bytes), "contentType": "image/jpeg"},
+    )
+    ext_resp.raise_for_status()
+    upload_data = ext_resp.json()
 
-    try:
-        hf_headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
-        logger.info(f"[{job_id}] Connecting to space: {space_id}")
-        client = Client(space_id, headers=hf_headers)
+    upload_url   = upload_data["body"]["uploadUrl"]
+    image_url    = upload_data["body"]["imageUrl"]
 
-        # Try with handle_file (newer gradio-client)
-        try:
-            from gradio_client import handle_file
-            result = client.predict(
-                dict={"background": handle_file(person_path), "layers": [], "composite": None},
-                garm_img=handle_file(garment_path),
-                garment_des=garment_desc,
-                is_checked=True,
-                is_checked_crop=True,
-                denoise_steps=30,
-                seed=42,
-                api_name="/tryon",
-            )
-        except (ImportError, Exception) as e1:
-            logger.warning(f"[{job_id}] handle_file failed: {e1}, trying filepath...")
-            # Fallback: pass file paths directly
-            result = client.predict(
-                dict={"background": person_path, "layers": [], "composite": None},
-                garm_img=garment_path,
-                garment_des=garment_desc,
-                is_checked=True,
-                is_checked_crop=True,
-                denoise_steps=30,
-                seed=42,
-                api_name="/tryon",
-            )
+    # Step 2: Upload image bytes to the presigned URL
+    put_resp = await client.put(
+        upload_url,
+        content=image_bytes,
+        headers={"Content-Type": "image/jpeg"},
+    )
+    put_resp.raise_for_status()
 
-        logger.info(f"[{job_id}] Raw result type: {type(result)}")
-
-        # Extract image from result
-        result_image = result[0] if isinstance(result, (list, tuple)) else result
-        if isinstance(result_image, dict):
-            result_image = (
-                result_image.get("url")
-                or result_image.get("path")
-                or str(result_image)
-            )
-
-        if isinstance(result_image, str) and result_image.startswith("http"):
-            return result_image
-        elif isinstance(result_image, str) and os.path.exists(result_image):
-            with open(result_image, "rb") as f:
-                img_data = f.read()
-            b64 = base64.b64encode(img_data).decode("utf-8")
-            return f"data:image/jpeg;base64,{b64}"
-        else:
-            raise ValueError(f"Cannot extract image from: {result!r}")
-
-    finally:
-        try: os.unlink(person_path)
-        except: pass
-        try: os.unlink(garment_path)
-        except: pass
+    return image_url
 
 
-async def run_vton_model(
+async def run_lightx_tryon(
     job_id: str,
     person_bytes: bytes,
     garment_bytes: bytes,
-    garment_desc: str,
 ):
+    """Call LightX virtual outfit try-on API."""
     jobs[job_id]["status"] = "processing"
 
-    last_error = None
-    for space_id in HF_SPACES:
-        try:
-            logger.info(f"[{job_id}] Trying space: {space_id}")
-            result_url = await asyncio.to_thread(
-                try_gradio_client,
-                space_id, person_bytes, garment_bytes, garment_desc, job_id
-            )
-            jobs[job_id]["status"]       = "succeeded"
-            jobs[job_id]["result_url"]   = result_url
-            jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
-            logger.info(f"[{job_id}] Job succeeded via {space_id}")
-            return
-        except Exception as e:
-            last_error = e
-            logger.warning(f"[{job_id}] Space {space_id} failed: {e}")
-            continue
+    try:
+        headers = {
+            "x-api-key": LIGHTX_API_KEY,
+            "Content-Type": "application/json",
+        }
 
-    # All spaces failed
-    logger.error(f"[{job_id}] All spaces failed:\n{traceback.format_exc()}")
-    jobs[job_id]["status"] = "failed"
-    jobs[job_id]["error"]  = f"All AI spaces unavailable. Last error: {str(last_error)}"
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            # Upload both images to LightX
+            logger.info(f"[{job_id}] Uploading images to LightX...")
+            person_url  = await upload_image_to_lightx(person_bytes, client)
+            garment_url = await upload_image_to_lightx(garment_bytes, client)
+
+            logger.info(f"[{job_id}] Submitting try-on request...")
+
+            # Submit try-on request
+            tryon_resp = await client.post(
+                f"{LIGHTX_BASE_URL}/virtual-outfit-tryon",
+                headers=headers,
+                json={
+                    "imageUrl": person_url,
+                    "clothImageUrl": garment_url,
+                },
+            )
+            tryon_resp.raise_for_status()
+            tryon_data = tryon_resp.json()
+
+            order_id = tryon_data.get("body", {}).get("orderId")
+            if not order_id:
+                raise Exception(f"No orderId returned: {tryon_data}")
+
+            logger.info(f"[{job_id}] LightX order ID: {order_id}")
+
+            # Poll for result
+            for attempt in range(40):
+                await asyncio.sleep(4)
+
+                status_resp = await client.post(
+                    f"{LIGHTX_BASE_URL}/order-status",
+                    headers=headers,
+                    json={"orderId": order_id},
+                )
+
+                if status_resp.status_code != 200:
+                    continue
+
+                status_data = status_resp.json()
+                status = status_data.get("body", {}).get("status")
+
+                logger.info(f"[{job_id}] LightX status: {status} (attempt {attempt+1})")
+
+                if status == "active":
+                    result_url = status_data.get("body", {}).get("output")
+                    if result_url:
+                        jobs[job_id]["status"]       = "succeeded"
+                        jobs[job_id]["result_url"]   = result_url
+                        jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+                        logger.info(f"[{job_id}] Job succeeded!")
+                        return
+                    else:
+                        raise Exception("Status active but no output image.")
+
+                elif status in ("failed", "error"):
+                    raise Exception(f"LightX processing failed: {status_data}")
+
+            raise Exception("Timed out waiting for LightX result.")
+
+    except Exception as e:
+        logger.error(f"[{job_id}] Error: {traceback.format_exc()}")
+        jobs[job_id]["status"] = "failed"
+        jobs[job_id]["error"]  = str(e)
 
 
 async def run_vton_two_pass(
@@ -190,33 +190,43 @@ async def run_vton_two_pass(
 ):
     try:
         if shirt_bytes and pant_bytes:
-            await run_vton_model(job_id, person_bytes, shirt_bytes, "upper body shirt")
+            # Pass 1: shirt
+            await run_lightx_tryon(job_id, person_bytes, shirt_bytes)
             if jobs[job_id]["status"] == "failed":
                 return
+
             intermediate_url = jobs[job_id]["result_url"]
             jobs[job_id]["result_url"] = None
             jobs[job_id]["status"]     = "processing"
-            if intermediate_url.startswith("data:image"):
-                intermediate_bytes = base64.b64decode(intermediate_url.split(",")[1])
-            else:
-                async with httpx.AsyncClient(timeout=60.0) as http:
-                    resp = await http.get(intermediate_url)
-                    resp.raise_for_status()
-                    intermediate_bytes = resp.content
-            await run_vton_model(job_id, intermediate_bytes, pant_bytes, "lower body pants")
+
+            # Download intermediate result for pass 2
+            async with httpx.AsyncClient(timeout=60.0) as http:
+                resp = await http.get(intermediate_url)
+                resp.raise_for_status()
+                intermediate_bytes = resp.content
+
+            # Pass 2: pant
+            await run_lightx_tryon(job_id, intermediate_bytes, pant_bytes)
+
         elif shirt_bytes:
-            await run_vton_model(job_id, person_bytes, shirt_bytes, "upper body shirt")
+            await run_lightx_tryon(job_id, person_bytes, shirt_bytes)
+
         elif pant_bytes:
-            await run_vton_model(job_id, person_bytes, pant_bytes, "lower body pants")
+            await run_lightx_tryon(job_id, person_bytes, pant_bytes)
+
     except Exception as e:
-        logger.error(f"[{job_id}] Two-pass error:\n{traceback.format_exc()}")
+        logger.error(f"[{job_id}] Two-pass error: {traceback.format_exc()}")
         jobs[job_id]["status"] = "failed"
-        jobs[job_id]["error"]  = f"{type(e).__name__}: {str(e)}"
+        jobs[job_id]["error"]  = str(e)
 
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "hf_token_set": bool(HF_TOKEN), "active_jobs": len(jobs)}
+    return {
+        "status": "ok",
+        "lightx_key_set": bool(LIGHTX_API_KEY),
+        "active_jobs": len(jobs),
+    }
 
 
 @app.post("/api/tryon/submit")
